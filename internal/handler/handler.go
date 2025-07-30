@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -29,6 +30,7 @@ func New(defaultURL, fallbackURL string, paymentUseCase *usecase.PaymentUseCase)
 }
 
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
 	processorStatus := h.gateway.GetProcessorStatus()
 	
 	status := map[string]interface{}{
@@ -44,8 +46,10 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 			"POST /payments - Processar pagamento",
 			"GET /payments/history - Histórico de pagamentos",
 			"GET /payments/stats - Estatísticas dos processors",
+			"GET /payments-summary - Resumo de pagamentos por período",
 			"GET /health - Status dos serviços",
 		},
+		"response_time_ms": time.Since(startTime).Milliseconds(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -53,6 +57,8 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ProcessPayment(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	
 	if r.Method != http.MethodPost {
 		http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
 		return
@@ -60,22 +66,38 @@ func (h *Handler) ProcessPayment(w http.ResponseWriter, r *http.Request) {
 
 	var req payment.PaymentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("ERRO: JSON inválido: %v", err)
 		http.Error(w, "JSON inválido", http.StatusBadRequest)
 		return
 	}
 
 	// Validações do payload da Rinha de Backend 2025
 	if req.CorrelationID == "" {
+		log.Printf("ERRO: correlationId ausente")
 		http.Error(w, "correlationId é obrigatório", http.StatusBadRequest)
 		return
 	}
 	if req.Amount <= 0 {
+		log.Printf("ERRO: amount inválido: %.2f", req.Amount)
 		http.Error(w, "amount deve ser maior que zero", http.StatusBadRequest)
 		return
 	}
 
+	log.Printf("Processando pagamento: correlationId=%s, amount=%.2f", req.CorrelationID, req.Amount)
+
 	// Processar pagamento usando o Use Case da Arquitetura 1
 	result := h.paymentUseCase.ProcessPayment(req)
+	
+	processingTime := time.Since(startTime)
+	
+	// Log do resultado
+	if result.Success {
+		log.Printf("✅ Pagamento processado com sucesso: correlationId=%s, processor=%s, time=%v", 
+			req.CorrelationID, result.ProcessorUsed, processingTime)
+	} else {
+		log.Printf("❌ Falha no pagamento: correlationId=%s, processor=%s, erro=%s, time=%v", 
+			req.CorrelationID, result.ProcessorUsed, result.Error, processingTime)
+	}
 
 	// Retornar resultado
 	if result.Success {
