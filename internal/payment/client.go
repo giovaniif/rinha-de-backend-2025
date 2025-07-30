@@ -15,20 +15,20 @@ type Client struct {
 	fallbackURL string
 }
 
+// PaymentRequest representa o payload da Rinha de Backend 2025
 type PaymentRequest struct {
-	Amount      float64 `json:"amount"`
-	Currency    string  `json:"currency"`
-	Description string  `json:"description"`
+	CorrelationID string  `json:"correlationId"`
+	Amount        float64 `json:"amount"`
 }
 
+// PaymentResponse representa a resposta do Payment Processor
 type PaymentResponse struct {
-	ID          string  `json:"id"`
-	Status      string  `json:"status"`
-	Amount      float64 `json:"amount"`
-	Currency    string  `json:"currency"`
-	Description string  `json:"description"`
-	Fee         float64 `json:"fee"`
-	ProcessedAt string  `json:"processed_at"`
+	ID            string  `json:"id"`
+	CorrelationID string  `json:"correlationId"`
+	Status        string  `json:"status"`
+	Amount        float64 `json:"amount"`
+	Fee           float64 `json:"fee,omitempty"`
+	ProcessedAt   string  `json:"processedAt"`
 }
 
 func NewClient(defaultURL, fallbackURL string) *Client {
@@ -41,6 +41,7 @@ func NewClient(defaultURL, fallbackURL string) *Client {
 	}
 }
 
+// ProcessPayment usa a lógica original de failover automático
 func (c *Client) ProcessPayment(req PaymentRequest) (*PaymentResponse, error) {
 	// Tentar primeiro com o serviço default
 	resp, err := c.sendPaymentRequest(c.defaultURL, req)
@@ -51,6 +52,11 @@ func (c *Client) ProcessPayment(req PaymentRequest) (*PaymentResponse, error) {
 	// Se falhar, tentar com o fallback
 	fmt.Printf("Erro no serviço default: %v. Tentando fallback...\n", err)
 	return c.sendPaymentRequest(c.fallbackURL, req)
+}
+
+// ProcessPaymentWithURL permite especificar o URL do processor - usado pelo UseCase
+func (c *Client) ProcessPaymentWithURL(url string, req PaymentRequest) (*PaymentResponse, error) {
+	return c.sendPaymentRequest(url, req)
 }
 
 func (c *Client) sendPaymentRequest(url string, req PaymentRequest) (*PaymentResponse, error) {
