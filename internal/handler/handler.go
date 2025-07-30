@@ -35,11 +35,13 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	
 	status := map[string]interface{}{
 		"status": "ok",
-		"architecture": "Arquitetura 1 - Rinha Backend 2025",
+		"architecture": "Arquitetura 2 - Rinha Backend 2025 (Redis Cache + Gateway Instance)",
 		"components": map[string]interface{}{
 			"processor_gateway": "online",
 			"payment_usecase":   "online",
 			"database":          "online",
+			"redis_cache":       "online", // Arquitetura 2
+			"gateway_instance":  "online", // Arquitetura 2
 		},
 		"processors": processorStatus,
 		"endpoints": []string{
@@ -48,6 +50,16 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 			"GET /payments/stats - Estatísticas dos processors",
 			"GET /payments-summary - Resumo de pagamentos por período",
 			"GET /health - Status dos serviços",
+		},
+		"cache_info": map[string]interface{}{
+			"enabled": true,
+			"ttl_seconds": 30,
+			"auto_invalidation": true,
+		},
+		"gateway_instance": map[string]interface{}{
+			"enabled": true,
+			"health_check_interval": "5s",
+			"running": true,
 		},
 		"response_time_ms": time.Since(startTime).Milliseconds(),
 	}
