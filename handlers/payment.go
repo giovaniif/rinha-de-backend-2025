@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log"
 	"net/http"
 	"time"
 
@@ -22,20 +23,31 @@ func NewPaymentHandler(paymentService *services.PaymentService) *PaymentHandler 
 func (h *PaymentHandler) ProcessPayment(c *gin.Context) {
 	var req models.PaymentRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("ERROR_PARSE_JSON: %s | IP: %s | Body: %s", err.Error(), c.ClientIP(), c.Request.Body)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
+	log.Printf("PAYMENT_REQUEST: correlationId=%s amount=%.2f", req.CorrelationID, req.Amount)
+
 	err := h.paymentService.ProcessPaymentRequest(c.Request.Context(), req)
 	if err != nil {
 		if err.Error() == "no gateway available" {
+			log.Printf("ERROR_NO_GATEWAY: correlationId=%s amount=%.2f", req.CorrelationID, req.Amount)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "service unavailable"})
 			return
 		}
+		if err.Error() == "payment queue is full" {
+			log.Printf("ERROR_QUEUE_FULL: correlationId=%s amount=%.2f", req.CorrelationID, req.Amount)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "queue full"})
+			return
+		}
+		log.Printf("ERROR_INTERNAL: correlationId=%s amount=%.2f error=%s", req.CorrelationID, req.Amount, err.Error())
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
+	log.Printf("PAYMENT_ACCEPTED: correlationId=%s amount=%.2f", req.CorrelationID, req.Amount)
 	c.JSON(http.StatusOK, gin.H{})
 }
 

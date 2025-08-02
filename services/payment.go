@@ -30,7 +30,7 @@ func NewPaymentService(redisClient *redis.Client, gatewayService *GatewayService
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		paymentQueue: make(chan models.PaymentJob, 1000),
+		paymentQueue: make(chan models.PaymentJob, 5000),
 		stats: map[string]*models.ProcessorSummary{
 			"default":  {TotalRequests: 0, TotalAmount: 0},
 			"fallback": {TotalRequests: 0, TotalAmount: 0},
@@ -56,11 +56,6 @@ func (p *PaymentService) paymentWorker(ctx context.Context) {
 }
 
 func (p *PaymentService) ProcessPaymentRequest(ctx context.Context, req models.PaymentRequest) error {
-	gatewayType, err := p.gatewayService.GetAvailableGateway(ctx)
-	if err != nil {
-		return fmt.Errorf("no gateway available: %w", err)
-	}
-
 	paymentReq := models.PaymentProcessorRequest{
 		CorrelationID: req.CorrelationID,
 		Amount:        req.Amount,
@@ -69,9 +64,9 @@ func (p *PaymentService) ProcessPaymentRequest(ctx context.Context, req models.P
 
 	job := models.PaymentJob{
 		PaymentRequest: paymentReq,
-		ProcessorType:  gatewayType,
+		ProcessorType:  "",
 		Attempts:       0,
-		MaxAttempts:    3,
+		MaxAttempts:    5,
 	}
 
 	select {
@@ -88,9 +83,21 @@ func (p *PaymentService) processPayment(ctx context.Context, job models.PaymentJ
 	job.Attempts++
 	log.Printf("Processing payment (attempt %d): %s", job.Attempts, job.PaymentRequest.CorrelationID)
 
+	// Selecionar gateway dinamicamente a cada tentativa
+	if job.ProcessorType == "" {
+		gatewayType, err := p.gatewayService.GetAvailableGateway(ctx)
+		if err != nil {
+			log.Printf("GATEWAY_UNAVAILABLE_RETRY: correlationId=%s attempt=%d", job.PaymentRequest.CorrelationID, job.Attempts)
+			p.retryNoGateway(ctx, job)
+			return
+		}
+		job.ProcessorType = gatewayType
+	}
+
 	gatewayURL := p.gatewayService.GetGatewayURL(job.ProcessorType)
 	if gatewayURL == "" {
 		log.Printf("Unknown gateway type: %s", job.ProcessorType)
+		p.retryOrFail(ctx, job)
 		return
 	}
 
@@ -127,15 +134,19 @@ func (p *PaymentService) processPayment(ctx context.Context, job models.PaymentJ
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		p.updateStats(job.ProcessorType, job.PaymentRequest.Amount)
-		log.Printf("Payment processed successfully: %s via %s", job.PaymentRequest.CorrelationID, job.ProcessorType)
+		log.Printf("PAYMENT_SUCCESS: correlationId=%s gateway=%s amount=%.2f attempt=%d status=%d", 
+			job.PaymentRequest.CorrelationID, job.ProcessorType, job.PaymentRequest.Amount, job.Attempts, resp.StatusCode)
 	} else {
-		log.Printf("Payment failed with status %d: %s", resp.StatusCode, job.PaymentRequest.CorrelationID)
+		log.Printf("PAYMENT_FAILED: correlationId=%s gateway=%s amount=%.2f attempt=%d status=%d", 
+			job.PaymentRequest.CorrelationID, job.ProcessorType, job.PaymentRequest.Amount, job.Attempts, resp.StatusCode)
 		p.retryOrFail(ctx, job)
 	}
 }
 
 func (p *PaymentService) retryOrFail(ctx context.Context, job models.PaymentJob) {
 	if job.Attempts < job.MaxAttempts {
+		// Reset processor type para tentar outro gateway
+		job.ProcessorType = ""
 		time.Sleep(1 * time.Second)
 		select {
 		case p.paymentQueue <- job:
@@ -145,6 +156,37 @@ func (p *PaymentService) retryOrFail(ctx context.Context, job models.PaymentJob)
 	} else {
 		log.Printf("Payment failed after %d attempts: %s", job.MaxAttempts, job.PaymentRequest.CorrelationID)
 	}
+}
+
+func (p *PaymentService) retryNoGateway(ctx context.Context, job models.PaymentJob) {
+	if job.Attempts >= job.MaxAttempts {
+		log.Printf("PAYMENT_FAILED_NO_GATEWAY: correlationId=%s attempts=%d", job.PaymentRequest.CorrelationID, job.Attempts)
+		return
+	}
+
+	// Exponential backoff para evitar spam quando todos os gateways estão down
+	backoffSeconds := []int{2, 5, 10, 15, 30}
+	attemptIndex := job.Attempts - 1
+	if attemptIndex >= len(backoffSeconds) {
+		attemptIndex = len(backoffSeconds) - 1
+	}
+	
+	delay := time.Duration(backoffSeconds[attemptIndex]) * time.Second
+	log.Printf("GATEWAY_RETRY_SCHEDULED: correlationId=%s attempt=%d delay=%v", 
+		job.PaymentRequest.CorrelationID, job.Attempts, delay)
+
+	// Usar goroutine para não bloquear o worker atual
+	go func() {
+		time.Sleep(delay)
+		select {
+		case p.paymentQueue <- job:
+			log.Printf("GATEWAY_RETRY_QUEUED: correlationId=%s attempt=%d", 
+				job.PaymentRequest.CorrelationID, job.Attempts)
+		default:
+			log.Printf("GATEWAY_RETRY_QUEUE_FULL: correlationId=%s attempt=%d", 
+				job.PaymentRequest.CorrelationID, job.Attempts)
+		}
+	}()
 }
 
 func (p *PaymentService) updateStats(processorType string, amount float64) {

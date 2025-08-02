@@ -38,11 +38,27 @@ func main() {
 	paymentHandler := handlers.NewPaymentHandler(paymentService)
 
 	gatewayService.StartHealthChecker(ctx)
-	paymentService.StartPaymentProcessor(ctx, 4)
+	paymentService.StartPaymentProcessor(ctx, 8)
 
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.Recovery())
+	
+	// Custom logging middleware para debug
+	router.Use(func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		duration := time.Since(start)
+		status := c.Writer.Status()
+		
+		if status >= 400 {
+			log.Printf("HTTP_ERROR: method=%s path=%s status=%d duration=%v ip=%s", 
+				c.Request.Method, c.Request.URL.Path, status, duration, c.ClientIP())
+		} else {
+			log.Printf("HTTP_OK: method=%s path=%s status=%d duration=%v", 
+				c.Request.Method, c.Request.URL.Path, status, duration)
+		}
+	})
 
 	router.POST("/payments", paymentHandler.ProcessPayment)
 	router.GET("/payments-summary", paymentHandler.GetPaymentsSummary)

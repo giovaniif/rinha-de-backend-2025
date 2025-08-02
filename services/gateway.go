@@ -110,20 +110,17 @@ func (g *GatewayService) removeGatewayFromCache(ctx context.Context, gatewayName
 
 func (g *GatewayService) GetAvailableGateway(ctx context.Context) (string, error) {
 	gateways := []string{"default", "fallback"}
-	log.Printf("Looking for available gateways...")
 	
 	for _, gateway := range gateways {
 		key := fmt.Sprintf("gateway:%s", gateway)
 		result := g.redisClient.Get(ctx, key)
 		if result.Err() == nil {
-			log.Printf("Found available gateway: %s", gateway)
+			log.Printf("GATEWAY_SELECTED: gateway=%s status=available", gateway)
 			return gateway, nil
-		} else {
-			log.Printf("Gateway %s not available: %v", gateway, result.Err())
 		}
 	}
 	
-	log.Printf("No gateway available")
+	log.Printf("GATEWAY_UNAVAILABLE: all_gateways_down")
 	return "", fmt.Errorf("no gateway available")
 }
 
