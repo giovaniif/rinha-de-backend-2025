@@ -44,7 +44,6 @@ func main() {
 	router := gin.New()
 	router.Use(gin.Recovery())
 	
-	// Custom logging middleware para debug
 	router.Use(func(c *gin.Context) {
 		start := time.Now()
 		c.Next()

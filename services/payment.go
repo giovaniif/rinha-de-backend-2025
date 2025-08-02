@@ -83,7 +83,6 @@ func (p *PaymentService) processPayment(ctx context.Context, job models.PaymentJ
 	job.Attempts++
 	log.Printf("Processing payment (attempt %d): %s", job.Attempts, job.PaymentRequest.CorrelationID)
 
-	// Selecionar gateway dinamicamente a cada tentativa
 	if job.ProcessorType == "" {
 		gatewayType, err := p.gatewayService.GetAvailableGateway(ctx)
 		if err != nil {
@@ -145,7 +144,6 @@ func (p *PaymentService) processPayment(ctx context.Context, job models.PaymentJ
 
 func (p *PaymentService) retryOrFail(ctx context.Context, job models.PaymentJob) {
 	if job.Attempts < job.MaxAttempts {
-		// Reset processor type para tentar outro gateway
 		job.ProcessorType = ""
 		time.Sleep(1 * time.Second)
 		select {
@@ -164,7 +162,6 @@ func (p *PaymentService) retryNoGateway(ctx context.Context, job models.PaymentJ
 		return
 	}
 
-	// Exponential backoff para evitar spam quando todos os gateways estão down
 	backoffSeconds := []int{2, 5, 10, 15, 30}
 	attemptIndex := job.Attempts - 1
 	if attemptIndex >= len(backoffSeconds) {
@@ -175,7 +172,6 @@ func (p *PaymentService) retryNoGateway(ctx context.Context, job models.PaymentJ
 	log.Printf("GATEWAY_RETRY_SCHEDULED: correlationId=%s attempt=%d delay=%v", 
 		job.PaymentRequest.CorrelationID, job.Attempts, delay)
 
-	// Usar goroutine para não bloquear o worker atual
 	go func() {
 		time.Sleep(delay)
 		select {
