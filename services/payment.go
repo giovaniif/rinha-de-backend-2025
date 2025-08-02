@@ -15,22 +15,37 @@ import (
 )
 
 type PaymentService struct {
-	redisClient    *redis.Client
-	gatewayService *GatewayService
-	httpClient     *http.Client
-	paymentQueue   chan models.PaymentJob
-	mu             sync.RWMutex
-	stats          map[string]*models.ProcessorSummary
+	redisClient      *redis.Client
+	gatewayService   *GatewayService
+	httpClient       *http.Client
+	paymentQueue     chan models.PaymentJob
+	mu               sync.RWMutex
+	stats            map[string]*models.ProcessorSummary
+	circuitBreakers  *ProcessorCircuitBreakers
 }
 
 func NewPaymentService(redisClient *redis.Client, gatewayService *GatewayService) *PaymentService {
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
+		DisableKeepAlives:   false,
+	}
+
+	httpClient := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: transport,
+	}
+
+	log.Printf("HTTP_CLIENT_OPTIMIZED: timeout=15s max_idle_conns=100 idle_timeout=90s")
+
 	return &PaymentService{
-		redisClient:    redisClient,
-		gatewayService: gatewayService,
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
-		paymentQueue: make(chan models.PaymentJob, 5000),
+		redisClient:     redisClient,
+		gatewayService:  gatewayService,
+		httpClient:      httpClient,
+		paymentQueue:    make(chan models.PaymentJob, 5000),
+		circuitBreakers: NewProcessorCircuitBreakers(),
 		stats: map[string]*models.ProcessorSummary{
 			"default":  {TotalRequests: 0, TotalAmount: 0},
 			"fallback": {TotalRequests: 0, TotalAmount: 0},
@@ -80,21 +95,37 @@ func (p *PaymentService) ProcessPaymentRequest(ctx context.Context, req models.P
 }
 
 func (p *PaymentService) processPayment(ctx context.Context, job models.PaymentJob) {
+	profile := &models.PaymentProfile{
+		CorrelationID:    job.PaymentRequest.CorrelationID,
+		StartTime:        time.Now(),
+		AttemptNumber:    job.Attempts + 1,
+		PaymentProcessor: job.ProcessorType,
+	}
+	defer p.logPaymentProfile(profile)
+
 	job.Attempts++
 	log.Printf("Processing payment (attempt %d): %s", job.Attempts, job.PaymentRequest.CorrelationID)
 
 	if job.ProcessorType == "" {
-		gatewayType, err := p.gatewayService.GetAvailableGateway(ctx)
+		gatewaySelectionStart := time.Now()
+		gatewayType, err := p.gatewayService.GetAvailableGatewayWithProfiling(ctx, job.PaymentRequest.CorrelationID)
+		profile.GatewaySelectionTime = time.Since(gatewaySelectionStart)
+		
 		if err != nil {
+			profile.Success = false
+			profile.ErrorType = "no_gateway_available"
 			log.Printf("GATEWAY_UNAVAILABLE_RETRY: correlationId=%s attempt=%d", job.PaymentRequest.CorrelationID, job.Attempts)
 			p.retryNoGateway(ctx, job)
 			return
 		}
 		job.ProcessorType = gatewayType
+		profile.PaymentProcessor = gatewayType
 	}
 
 	gatewayURL := p.gatewayService.GetGatewayURL(job.ProcessorType)
 	if gatewayURL == "" {
+		profile.Success = false
+		profile.ErrorType = "unknown_gateway_type"
 		log.Printf("Unknown gateway type: %s", job.ProcessorType)
 		p.retryOrFail(ctx, job)
 		return
@@ -102,8 +133,14 @@ func (p *PaymentService) processPayment(ctx context.Context, job models.PaymentJ
 
 	paymentURL := fmt.Sprintf("%s/payments", gatewayURL)
 
+	// JSON Serialization profiling
+	jsonStart := time.Now()
 	jsonData, err := json.Marshal(job.PaymentRequest)
+	profile.JSONSerializationTime = time.Since(jsonStart)
+	
 	if err != nil {
+		profile.Success = false
+		profile.ErrorType = "json_marshal_error"
 		log.Printf("Failed to marshal payment request: %v", err)
 		p.retryOrFail(ctx, job)
 		return
@@ -113,6 +150,8 @@ func (p *PaymentService) processPayment(ctx context.Context, job models.PaymentJ
 
 	req, err := http.NewRequestWithContext(ctx, "POST", paymentURL, bytes.NewBuffer(jsonData))
 	if err != nil {
+		profile.Success = false
+		profile.ErrorType = "http_request_creation_error"
 		log.Printf("Failed to create payment request: %v", err)
 		p.retryOrFail(ctx, job)
 		return
@@ -123,23 +162,71 @@ func (p *PaymentService) processPayment(ctx context.Context, job models.PaymentJ
 	
 	log.Printf("Request headers: %v", req.Header)
 
-	resp, err := p.httpClient.Do(req)
+	// Circuit breaker protection
+	circuitBreaker := p.circuitBreakers.GetOrCreateBreaker(job.ProcessorType)
+	
+	if !circuitBreaker.CanExecute() {
+		profile.Success = false
+		profile.ErrorType = "circuit_breaker_open"
+		log.Printf("CIRCUIT_BREAKER_BLOCKED: correlationId=%s processor=%s", 
+			job.PaymentRequest.CorrelationID, job.ProcessorType)
+		p.retryOrFail(ctx, job)
+		return
+	}
+
+	// HTTP Request profiling with circuit breaker
+	httpStart := time.Now()
+	var resp *http.Response
+	
+	err = circuitBreaker.Call(func() error {
+		var httpErr error
+		resp, httpErr = p.httpClient.Do(req)
+		
+		if httpErr != nil {
+			return httpErr
+		}
+		
+		if resp.StatusCode >= 500 {
+			return fmt.Errorf("server error: status %d", resp.StatusCode)
+		}
+		
+		return nil
+	})
+	
+	profile.HTTPRequestTime = time.Since(httpStart)
+	
 	if err != nil {
-		log.Printf("Failed to send payment request: %v", err)
+		profile.Success = false
+		if resp != nil {
+			profile.StatusCode = resp.StatusCode
+			profile.ErrorType = fmt.Sprintf("http_status_%d", resp.StatusCode)
+		} else {
+			profile.ErrorType = "http_request_error"
+		}
+		log.Printf("PAYMENT_FAILED_CIRCUIT: correlationId=%s gateway=%s error=%v", 
+			job.PaymentRequest.CorrelationID, job.ProcessorType, err)
 		p.retryOrFail(ctx, job)
 		return
 	}
 	defer resp.Body.Close()
 
+	profile.StatusCode = resp.StatusCode
+
+	// Response processing
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		profile.Success = true
 		p.updateStats(job.ProcessorType, job.PaymentRequest.Amount)
 		log.Printf("PAYMENT_SUCCESS: correlationId=%s gateway=%s amount=%.2f attempt=%d status=%d", 
 			job.PaymentRequest.CorrelationID, job.ProcessorType, job.PaymentRequest.Amount, job.Attempts, resp.StatusCode)
 	} else {
+		profile.Success = false
+		profile.ErrorType = fmt.Sprintf("http_status_%d", resp.StatusCode)
 		log.Printf("PAYMENT_FAILED: correlationId=%s gateway=%s amount=%.2f attempt=%d status=%d", 
 			job.PaymentRequest.CorrelationID, job.ProcessorType, job.PaymentRequest.Amount, job.Attempts, resp.StatusCode)
 		p.retryOrFail(ctx, job)
 	}
+	
+	profile.TotalTime = time.Since(profile.StartTime)
 }
 
 func (p *PaymentService) retryOrFail(ctx context.Context, job models.PaymentJob) {
@@ -203,4 +290,54 @@ func (p *PaymentService) GetPaymentsSummary(from, to time.Time) models.PaymentsS
 		Default:  *p.stats["default"],
 		Fallback: *p.stats["fallback"],
 	}
+}
+
+func (p *PaymentService) logPaymentProfile(profile *models.PaymentProfile) {
+	if profile.TotalTime > 500*time.Millisecond {
+		log.Printf("PAYMENT_PROCESSING_SLOW: correlationId=%s total=%v gateway_selection=%v json_serialization=%v http_request=%v processor=%s attempt=%d success=%t status=%d error=%s",
+			profile.CorrelationID,
+			profile.TotalTime,
+			profile.GatewaySelectionTime,
+			profile.JSONSerializationTime,
+			profile.HTTPRequestTime,
+			profile.PaymentProcessor,
+			profile.AttemptNumber,
+			profile.Success,
+			profile.StatusCode,
+			profile.ErrorType)
+	}
+	
+	if profile.HTTPRequestTime > 200*time.Millisecond {
+		log.Printf("HTTP_REQUEST_SLOW: correlationId=%s http_time=%v processor=%s status=%d",
+			profile.CorrelationID,
+			profile.HTTPRequestTime,
+			profile.PaymentProcessor,
+			profile.StatusCode)
+	}
+	
+	if profile.JSONSerializationTime > 10*time.Millisecond {
+		log.Printf("JSON_SERIALIZATION_SLOW: correlationId=%s json_time=%v",
+			profile.CorrelationID,
+			profile.JSONSerializationTime)
+	}
+}
+
+func (p *PaymentService) GetCircuitBreakerStats() map[string]interface{} {
+	p.circuitBreakers.mu.RLock()
+	defer p.circuitBreakers.mu.RUnlock()
+	
+	stats := make(map[string]interface{})
+	
+	for name, breaker := range p.circuitBreakers.breakers {
+		state, failureCount, successCount, lastFailTime := breaker.GetStats()
+		
+		stats[name] = map[string]interface{}{
+			"state":        state,
+			"failureCount": failureCount,
+			"successCount": successCount,
+			"lastFailTime": lastFailTime,
+		}
+	}
+	
+	return stats
 }

@@ -29,6 +29,13 @@ type GatewayService struct {
 	httpClient      *http.Client
 	gateways        map[string]*GatewayStatus
 	mu              sync.RWMutex
+	localCache      map[string]gatewayCache
+	localCacheMu    sync.RWMutex
+}
+
+type gatewayCache struct {
+	status    string
+	expireAt  time.Time
 }
 
 func NewGatewayService(redisClient *redis.Client) *GatewayService {
@@ -60,6 +67,7 @@ func NewGatewayService(redisClient *redis.Client) *GatewayService {
 				HealthCheckInterval: 6 * time.Second,
 			},
 		},
+		localCache: make(map[string]gatewayCache),
 	}
 }
 
@@ -289,33 +297,144 @@ func (g *GatewayService) removeGatewayFromCacheUnlocked(ctx context.Context, gat
 }
 
 func (g *GatewayService) GetAvailableGateway(ctx context.Context) (string, error) {
+	return g.GetAvailableGatewayWithProfiling(ctx, "")
+}
+
+func (g *GatewayService) GetAvailableGatewayWithProfiling(ctx context.Context, correlationID string) (string, error) {
+	profile := &models.GatewaySelectionProfile{
+		CorrelationID: correlationID,
+		StartTime:     time.Now(),
+	}
+	defer g.logSelectionProfile(profile)
+	
 	gateways := []string{"default", "fallback"}
 	
 	for _, gatewayName := range gateways {
-		key := fmt.Sprintf("gateway:%s", gatewayName)
-		result := g.redisClient.Get(ctx, key)
-		if result.Err() == nil {
-			value, _ := result.Result()
-			log.Printf("GATEWAY_SELECTED: gateway=%s status=%s", gatewayName, value)
+		if cached := g.getFromLocalCache(gatewayName); cached != "" {
+			profile.TotalTime = time.Since(profile.StartTime)
+			profile.SelectedGateway = gatewayName
+			profile.SelectionMethod = "local_cache"
+			
+			log.Printf("GATEWAY_SELECTED_LOCAL: gateway=%s status=%s time=%v", gatewayName, cached, profile.TotalTime)
 			return gatewayName, nil
 		}
 	}
 	
+	redisStart := time.Now()
+	gatewayStatuses := g.getBatchGatewayStatus(ctx, gateways)
+	profile.RedisHits = len(gateways)
+	
+	for _, gatewayName := range gateways {
+		if status, exists := gatewayStatuses[gatewayName]; exists {
+			g.setLocalCache(gatewayName, status, 3*time.Second)
+			
+			profile.RedisLookupTime = time.Since(redisStart)
+			profile.TotalTime = time.Since(profile.StartTime)
+			profile.SelectedGateway = gatewayName
+			profile.SelectionMethod = "redis_cache"
+			
+			log.Printf("GATEWAY_SELECTED: gateway=%s status=%s time=%v", gatewayName, status, profile.TotalTime)
+			return gatewayName, nil
+		}
+	}
+	profile.RedisLookupTime = time.Since(redisStart)
+	
 	log.Printf("GATEWAY_FALLBACK_TO_LAST_KNOWN: checking historical availability")
+	historyStart := time.Now()
+	profile.HistoryChecked = true
 	bestGateway := g.getBestAvailableFromHistory()
+	profile.HistoryLookupTime = time.Since(historyStart)
+	
 	if bestGateway != "" {
-		log.Printf("GATEWAY_SELECTED_FROM_HISTORY: gateway=%s", bestGateway)
+		profile.TotalTime = time.Since(profile.StartTime)
+		profile.SelectedGateway = bestGateway
+		profile.SelectionMethod = "history_cache"
+		
+		log.Printf("GATEWAY_SELECTED_FROM_HISTORY: gateway=%s time=%v", bestGateway, profile.TotalTime)
 		return bestGateway, nil
 	}
 	
+	gracePeriodStart := time.Now()
+	profile.GracePeriodUsed = true
 	gracePeriodGateway := g.getGracePeriodGateway()
+	profile.GracePeriodTime = time.Since(gracePeriodStart)
+	
 	if gracePeriodGateway != "" {
-		log.Printf("GATEWAY_SELECTED_GRACE_PERIOD: gateway=%s", gracePeriodGateway)
+		profile.TotalTime = time.Since(profile.StartTime)
+		profile.SelectedGateway = gracePeriodGateway
+		profile.SelectionMethod = "grace_period"
+		
+		log.Printf("GATEWAY_SELECTED_GRACE_PERIOD: gateway=%s time=%v", gracePeriodGateway, profile.TotalTime)
 		return gracePeriodGateway, nil
 	}
 	
-	log.Printf("GATEWAY_UNAVAILABLE: all_gateways_exhausted")
+	profile.TotalTime = time.Since(profile.StartTime)
+	profile.SelectionMethod = "failed"
+	
+	log.Printf("GATEWAY_UNAVAILABLE: all_gateways_exhausted time=%v", profile.TotalTime)
 	return "", fmt.Errorf("no gateway available")
+}
+
+func (g *GatewayService) getFromLocalCache(gatewayName string) string {
+	g.localCacheMu.RLock()
+	defer g.localCacheMu.RUnlock()
+	
+	if cached, exists := g.localCache[gatewayName]; exists {
+		if time.Now().Before(cached.expireAt) {
+			return cached.status
+		}
+		delete(g.localCache, gatewayName)
+	}
+	return ""
+}
+
+func (g *GatewayService) setLocalCache(gatewayName, status string, ttl time.Duration) {
+	g.localCacheMu.Lock()
+	defer g.localCacheMu.Unlock()
+	
+	g.localCache[gatewayName] = gatewayCache{
+		status:   status,
+		expireAt: time.Now().Add(ttl),
+	}
+}
+
+func (g *GatewayService) getBatchGatewayStatus(ctx context.Context, gateways []string) map[string]string {
+	pipe := g.redisClient.Pipeline()
+	
+	commands := make(map[string]*redis.StringCmd)
+	for _, gatewayName := range gateways {
+		key := fmt.Sprintf("gateway:%s", gatewayName)
+		commands[gatewayName] = pipe.Get(ctx, key)
+	}
+	
+	_, err := pipe.Exec(ctx)
+	if err != nil && err != redis.Nil {
+		log.Printf("Redis pipeline error: %v", err)
+		return make(map[string]string)
+	}
+	
+	result := make(map[string]string)
+	for gatewayName, cmd := range commands {
+		if val, err := cmd.Result(); err == nil {
+			result[gatewayName] = val
+		}
+	}
+	
+	return result
+}
+
+func (g *GatewayService) logSelectionProfile(profile *models.GatewaySelectionProfile) {
+	if profile.TotalTime > 50*time.Millisecond {
+		log.Printf("GATEWAY_SELECTION_SLOW: correlationId=%s total=%v redis=%v history=%v grace=%v method=%s gateway=%s hits=%d",
+			profile.CorrelationID,
+			profile.TotalTime,
+			profile.RedisLookupTime,
+			profile.HistoryLookupTime,
+			profile.GracePeriodTime,
+			profile.SelectionMethod,
+			profile.SelectedGateway,
+			profile.RedisHits)
+	}
 }
 
 func (g *GatewayService) getBestAvailableFromHistory() string {
