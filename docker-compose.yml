@@ -1,131 +1,64 @@
-version: '3.8'
-
 services:
-  # Banco de dados PostgreSQL
-  postgres:
-    image: postgres:15-alpine
-    container_name: rinha-postgres
-    environment:
-      - POSTGRES_DB=rinha_payments
-      - POSTGRES_USER=rinha_user
-      - POSTGRES_PASSWORD=rinha_password
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rinha_user -d rinha_payments"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    deploy:
-      resources:
-        limits:
-          cpus: "0.25"
-          memory: "128MB"
-
-  # Redis Cache para Arquitetura 2
-  redis:
-    image: redis:7-alpine
-    container_name: rinha-redis
-    ports:
-      - "6379:6379"
-    command: redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    deploy:
-      resources:
-        limits:
-          cpus: "0.1"
-          memory: "64MB"
-
-  # API Principal - Instância 1
-  api01:
-    build: .
-    container_name: rinha-api01
-    environment:
-      - PORT=8080
-      - PAYMENT_PROCESSOR_URL_DEFAULT=http://172.17.0.1:8001
-      - PAYMENT_PROCESSOR_URL_FALLBACK=http://172.17.0.1:8002
-      - DATABASE_URL=postgres://rinha_user:rinha_password@postgres:5432/rinha_payments?sslmode=disable
-      - REDIS_URL=redis://redis:6379
-    ports:
-      - "8081:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-    deploy:
-      resources:
-        limits:
-          cpus: "0.65"
-          memory: "256MB"
-
-  # API Principal - Instância 2
-  api02:
-    build: .
-    container_name: rinha-api02
-    environment:
-      - PORT=8080
-      - PAYMENT_PROCESSOR_URL_DEFAULT=http://172.17.0.1:8001
-      - PAYMENT_PROCESSOR_URL_FALLBACK=http://172.17.0.1:8002
-      - DATABASE_URL=postgres://rinha_user:rinha_password@postgres:5432/rinha_payments?sslmode=disable
-      - REDIS_URL=redis://redis:6379
-    ports:
-      - "8082:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-    deploy:
-      resources:
-        limits:
-          cpus: "0.65"
-          memory: "256MB"
-
-  # Load Balancer Nginx
   nginx:
     image: nginx:alpine
-    container_name: rinha-nginx
     ports:
-      - "9999:9999"
+      - "9999:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      - api01
-      - api02
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9999/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      - api1
+      - api2
+    networks:
+      - payment-processor
+    restart: unless-stopped
     deploy:
       resources:
         limits:
           cpus: "0.1"
-          memory: "32MB"
+          memory: "20MB"
 
-  
-volumes:
-  postgres_data:
+  api1:
+    build: .
+    environment:
+      - REDIS_URL=redis:6379
+    depends_on:
+      - redis
+    networks:
+      - payment-processor
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.6"
+          memory: "150MB"
+
+  api2:
+    build: .
+    environment:
+      - REDIS_URL=redis:6379
+    depends_on:
+      - redis
+    networks:
+      - payment-processor
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.6"
+          memory: "150MB"
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru
+    networks:
+      - payment-processor
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: "30MB"
 
 networks:
-  default:
-    name: rinha-network 
+  payment-processor:
+    external: true
